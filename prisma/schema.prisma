@@ -1,0 +1,102 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum TokenStatus {
+  active
+  expired
+  revoked
+}
+
+enum PostStatus {
+  pending_confirmation
+  confirmed
+  deleted
+}
+
+model UserSocialAccount {
+  id               String      @id @default(uuid())
+  userId           String      @map("user_id")
+  platform         String      @default("x")
+  externalUserId   String      @map("external_user_id")
+  handle           String
+  accessTokenEnc   String      @map("access_token_enc")
+  accessTokenExpiresAt DateTime? @map("access_token_expires_at")
+  refreshTokenEnc  String?     @map("refresh_token_enc")
+  tokenStatus      TokenStatus @default(active) @map("token_status")
+  connectedAt      DateTime    @default(now()) @map("connected_at")
+
+  @@unique([userId, platform])
+  @@map("user_social_account")
+}
+
+model SocialShare {
+  id             String      @id @default(uuid())
+  userId         String      @map("user_id")
+  externalPostId String?     @map("external_post_id")
+  copyVariant    String      @default("v1_static") @map("copy_variant")
+  postStatus     PostStatus  @default(pending_confirmation) @map("post_status")
+  sharedAt       DateTime    @default(now()) @map("shared_at")
+
+  snapshots     EngagementSnapshot[]
+  manualCredits ManualCredit[]
+
+  @@map("social_share")
+}
+
+model EngagementSnapshot {
+  id         String   @id @default(uuid())
+  shareId    String   @map("share_id")
+  likes          Int      @default(0)
+  retweets       Int      @default(0)
+  quoteCount     Int      @default(0) @map("quote_count")
+  replies        Int      @default(0)
+  bookmarkCount  Int      @default(0) @map("bookmark_count")
+  impressionCount Int     @default(0) @map("impression_count")
+  fetchedAt      DateTime @default(now()) @map("fetched_at")
+
+  share SocialShare @relation(fields: [shareId], references: [id])
+
+  @@map("engagement_snapshot")
+}
+
+// Short-lived record bridging /connect/init -> /connect/callback (PKCE verifier +
+// which user/platform initiated it). Kept in the DB rather than in-memory so a
+// service restart mid-event doesn't strand an in-flight OAuth handshake.
+model PendingOAuthState {
+  state     String   @id
+  userId    String   @map("user_id")
+  platform  String
+  verifier  String
+  createdAt DateTime @default(now()) @map("created_at")
+  expiresAt DateTime @map("expires_at")
+
+  @@map("pending_oauth_state")
+}
+
+model RewardThreshold {
+  id       String  @id @default(uuid())
+  metric   String
+  minValue Int     @map("min_value")
+  active   Boolean @default(true)
+
+  @@map("reward_threshold")
+}
+
+model ManualCredit {
+  id       String   @id @default(uuid())
+  userId   String   @map("user_id")
+  shareId  String   @map("share_id")
+  amount   Decimal
+  issuedBy String   @map("issued_by")
+  issuedAt DateTime @default(now()) @map("issued_at")
+
+  share SocialShare @relation(fields: [shareId], references: [id])
+
+  @@map("manual_credit")
+}
