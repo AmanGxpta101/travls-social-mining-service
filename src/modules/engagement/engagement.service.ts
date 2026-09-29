@@ -62,10 +62,15 @@ export class EngagementService {
     const result = await fetchTweetMetrics(share.externalPostId);
 
     if (result.status === "deleted") {
-      // Per plan §7.3: freeze last-known metrics, never drop the row.
-      await this.prisma.socialShare.update({ where: { id: shareId }, data: { postStatus: "deleted" } });
+      // Per plan §7.3: freeze last-known metrics, never drop the row. Only a
+      // confirmed share becomes "deleted" — overwriting "invalidated" would
+      // quietly turn an ops rejection back into a completed challenge.
+      const postStatus = share.postStatus === "confirmed" ? ("deleted" as const) : share.postStatus;
+      if (postStatus !== share.postStatus) {
+        await this.prisma.socialShare.update({ where: { id: shareId }, data: { postStatus } });
+      }
       const last = await this.latestSnapshot(shareId);
-      return { snapshot: last ? mapSnapshot(last) : null, postStatus: "deleted" as const };
+      return { snapshot: last ? mapSnapshot(last) : null, postStatus };
     }
 
     const snapshot = await this.prisma.engagementSnapshot.create({
@@ -86,6 +91,11 @@ export class EngagementService {
   async getEngagement(userId: string, shareId: string) {
     const share = await this.prisma.socialShare.findUnique({ where: { id: shareId } });
     if (!share || share.userId !== userId) throw new NotFoundException("share not found");
+
+    // Community-tier share the user hasn't posted/confirmed yet — nothing to fetch.
+    if (!share.externalPostId) {
+      return { ...zeroSnapshot(), postStatus: share.postStatus };
+    }
 
     if (share.postStatus === "deleted") {
       const last = await this.latestSnapshot(shareId);

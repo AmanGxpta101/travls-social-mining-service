@@ -2,7 +2,7 @@ import { CanActivate, ExecutionContext, Injectable, UnauthorizedException } from
 import type { Request } from "express";
 import { env } from "../env";
 
-/** Ops routes (Retool/Airtable sync) authenticate with a separate internal key, not a user session. */
+/** Ops routes (internal ops dashboard) authenticate with a separate internal key, not a user session. */
 @Injectable()
 export class OpsKeyGuard implements CanActivate {
   canActivate(context: ExecutionContext): boolean {

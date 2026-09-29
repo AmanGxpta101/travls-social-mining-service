@@ -27,7 +27,7 @@ export class RewardsService {
     for (const share of shares) {
       const snapshot = share.snapshots[0];
       if (!snapshot) continue;
-      const result = await this.thresholdService.evaluate(snapshot);
+      const result = await this.thresholdService.evaluate(snapshot, share.tier);
       if (result.eligible) eligible = true;
       for (const m of result.thresholdsMet) metThresholds.add(m);
     }

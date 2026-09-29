@@ -13,10 +13,22 @@ enum TokenStatus {
   revoked
 }
 
+// Which share flow a share went through, and which reward thresholds apply to it.
+// kol: ops-allowlisted, posted directly via the X API on the user's behalf
+// ($0.20/post). community: everyone else — they post the template themselves
+// and submit the post id back; we verify with one app-only read ($0.005).
+enum ShareTier {
+  kol
+  community
+}
+
 enum PostStatus {
   pending_confirmation
   confirmed
   deleted
+  // Ops rejected the submission. The task counts as not done, so the user can
+  // do it again (with a new post — this one stays claimed).
+  invalidated
 }
 
 model UserSocialAccount {
@@ -32,14 +44,30 @@ model UserSocialAccount {
   connectedAt      DateTime    @default(now()) @map("connected_at")
 
   @@unique([userId, platform])
+  // One Travls user per X account — otherwise a single X account could farm
+  // every task once per Travls account it's linked to.
+  @@unique([platform, externalUserId])
   @@map("user_social_account")
 }
 
 model SocialShare {
   id             String      @id @default(uuid())
   userId         String      @map("user_id")
-  externalPostId String?     @map("external_post_id")
+  // Unique so the same post can't be claimed by two shares.
+  externalPostId String?     @unique @map("external_post_id")
   copyVariant    String      @default("v1_static") @map("copy_variant")
+  tier           ShareTier   @default(kol)
+  // community tier only: per-share code embedded in the template's link, which
+  // verification requires to be present in the submitted post.
+  refCode        String?     @unique @map("ref_code")
+  // The X account that actually posted, captured at post/verify time. The
+  // user's connected account can change later, so ops must not derive a
+  // share's handle from it. Null on community shares until verified.
+  authorXUserId  String?     @map("author_x_user_id")
+  authorHandle   String?     @map("author_handle")
+  invalidatedReason String?  @map("invalidated_reason")
+  invalidatedBy     String?  @map("invalidated_by")
+  invalidatedAt     DateTime? @map("invalidated_at")
   postStatus     PostStatus  @default(pending_confirmation) @map("post_status")
   sharedAt       DateTime    @default(now()) @map("shared_at")
 
@@ -80,10 +108,13 @@ model PendingOAuthState {
 }
 
 model RewardThreshold {
-  id       String  @id @default(uuid())
+  id       String    @id @default(uuid())
   metric   String
-  minValue Int     @map("min_value")
-  active   Boolean @default(true)
+  tier     ShareTier @default(kol)
+  minValue Int       @map("min_value")
+  active   Boolean   @default(true)
+
+  @@unique([metric, tier])
 
   @@map("reward_threshold")
 }
@@ -99,4 +130,108 @@ model ManualCredit {
   share SocialShare @relation(fields: [shareId], references: [id])
 
   @@map("manual_credit")
+}
+
+// Users ops has marked as KOLs — their shares take the direct-post flow.
+// Everyone else gets the clipboard template + paste-back flow.
+model KolAllowlist {
+  userId  String   @id @map("user_id")
+  addedBy String   @map("added_by")
+  addedAt DateTime @default(now()) @map("added_at")
+
+  @@map("kol_allowlist")
+}
+
+// Challenges users can complete. Ops can add and retire them from the
+// dashboard; a share records its challenge id in copy_variant.
+model ShareTask {
+  id          String   @id
+  title       String
+  description String
+  // Must contain `{link}`, replaced with the landing / per-share ref link.
+  template    String
+  points      Int
+  active      Boolean  @default(true)
+  createdBy   String   @map("created_by")
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  @@map("share_task")
+}
+
+// Ops disabled one challenge for one user.
+model TaskBlock {
+  userId    String   @map("user_id")
+  taskId    String   @map("task_id")
+  reason    String
+  blockedBy String   @map("blocked_by")
+  blockedAt DateTime @default(now()) @map("blocked_at")
+
+  @@id([userId, taskId])
+  @@map("task_block")
+}
+
+// Points ops took away (stored negative), with the reason shown to the user.
+model PointsAdjustment {
+  id       String   @id @default(uuid())
+  userId   String   @map("user_id")
+  shareId  String?  @map("share_id")
+  amount   Int
+  reason   String
+  issuedBy String   @map("issued_by")
+  issuedAt DateTime @default(now()) @map("issued_at")
+
+  @@index([userId])
+  @@map("points_adjustment")
+}
+
+enum PointsEntryStatus {
+  // Recorded here, not yet accepted by Travls — the sync job retries it.
+  pending
+  synced
+  failed
+}
+
+// The change log for every write to a user's Travls points. Travls' own
+// points are the currency (decided 2026-09-29, "scenario 1"), so their backend
+// holds the balance and we add/remove on it. One row per add or remove; reads
+// are never logged. Rows are the outbox too: written before the call to
+// Travls, retried until synced, and keyed so a retry can't double-apply.
+model PointsLedgerEntry {
+  id             String            @id @default(uuid())
+  userId         String            @map("user_id")
+  // Signed: positive adds, negative removes.
+  amount         Int
+  // Shown to the user and sent to Travls, e.g. `Completed "Announce you joined Travls"`.
+  reason         String
+  // challenge_completed | challenge_revoked | ops_deduction
+  kind           String
+  shareId        String?           @map("share_id")
+  adjustmentId   String?           @map("adjustment_id")
+  idempotencyKey String            @unique @map("idempotency_key")
+  status         PointsEntryStatus @default(pending)
+  // Travls' balance just before and after this write — "200 -> 300".
+  balanceBefore  Int?              @map("balance_before")
+  balanceAfter   Int?              @map("balance_after")
+  attempts       Int               @default(0)
+  lastError      String?           @map("last_error")
+  createdBy      String            @map("created_by")
+  createdAt      DateTime          @default(now()) @map("created_at")
+  syncedAt       DateTime?         @map("synced_at")
+  // Synced to the in-memory stand-in, not to Travls. Re-queued as soon as the
+  // service starts with a real LEDGER_API_URL, so none of it is lost.
+  simulated      Boolean           @default(false)
+
+  @@index([userId, createdAt])
+  @@index([status])
+  @@map("points_ledger_entry")
+}
+
+// Our copy of each user's Travls balance, for reconciliation against theirs.
+// Refreshed on every read of and write to Travls.
+model TravlsPointsBalance {
+  userId    String   @id @map("user_id")
+  balance   Int
+  fetchedAt DateTime @map("fetched_at")
+
+  @@map("travls_points_balance")
 }

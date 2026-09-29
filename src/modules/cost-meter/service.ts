@@ -8,16 +8,22 @@
 // URL — NOT the $0.015 base rate), engagement reads are $0.005/resource
 // (third-party rate, since these are connected users' posts, not the app's
 // own — doesn't qualify for the cheaper $0.001 "Owned Read" rate). User
-// lookup cost wasn't confirmed in the docs fetched, left unpriced below.
+// lookup and media upload costs weren't confirmed in the docs fetched
+// (2026-09-23 pricing page lists no media upload rate), left unpriced below.
 const APPROX_USD_COST: Record<string, number | undefined> = {
   share_post: 0.2,
   engagement_fetch: 0.005,
+  // Community-tier paste-back verification: same tweet lookup, same rate.
+  share_verify: 0.005,
   user_lookup: undefined,
+  media_upload: undefined,
 };
 
 let callsThisProcess = 0;
 
-export function recordXApiCall(purpose: "user_lookup" | "engagement_fetch" | "share_post") {
+export function recordXApiCall(
+  purpose: "user_lookup" | "engagement_fetch" | "share_verify" | "share_post" | "media_upload",
+) {
   callsThisProcess += 1;
   console.log(
     JSON.stringify({

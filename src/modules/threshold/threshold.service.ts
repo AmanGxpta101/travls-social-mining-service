@@ -1,4 +1,5 @@
 import { Injectable, OnModuleInit } from "@nestjs/common";
+import type { ShareTier } from "@prisma/client";
 import { PrismaService } from "../../prisma/prisma.service";
 
 interface MetricSnapshot {
@@ -27,10 +28,16 @@ const METRIC_FIELD: Record<string, keyof MetricSnapshot> = {
  * alongside the other public_metrics fields.
  * Seeded here so Phase 0 has something to run against; add the third metric
  * as another active row once confirmed, no code change needed.
+ *
+ * Thresholds are per tier (kol = direct-post, community = paste-back) so ops
+ * can hold community shares to a different bar. Both start at the same values;
+ * tune the community rows in the DB once there's real data.
  */
-const DEFAULT_THRESHOLDS = [
-  { metric: "retweets", minValue: 5 },
-  { metric: "likes", minValue: 25 },
+const DEFAULT_THRESHOLDS: { metric: string; tier: ShareTier; minValue: number }[] = [
+  { metric: "retweets", tier: "kol", minValue: 5 },
+  { metric: "likes", tier: "kol", minValue: 25 },
+  { metric: "retweets", tier: "community", minValue: 5 },
+  { metric: "likes", tier: "community", minValue: 25 },
 ];
 
 @Injectable()
@@ -39,17 +46,16 @@ export class ThresholdService implements OnModuleInit {
 
   async onModuleInit() {
     for (const t of DEFAULT_THRESHOLDS) {
-      const existing = await this.prisma.rewardThreshold.findFirst({ where: { metric: t.metric } });
-      if (!existing) {
-        await this.prisma.rewardThreshold.create({
-          data: { metric: t.metric, minValue: t.minValue, active: true },
-        });
-      }
+      await this.prisma.rewardThreshold.upsert({
+        where: { metric_tier: { metric: t.metric, tier: t.tier } },
+        create: { metric: t.metric, tier: t.tier, minValue: t.minValue, active: true },
+        update: {},
+      });
     }
   }
 
-  async evaluate(snapshot: MetricSnapshot) {
-    const thresholds = await this.prisma.rewardThreshold.findMany({ where: { active: true } });
+  async evaluate(snapshot: MetricSnapshot, tier: ShareTier) {
+    const thresholds = await this.prisma.rewardThreshold.findMany({ where: { active: true, tier } });
     const thresholdsMet: string[] = [];
     let allMet = thresholds.length > 0;
 

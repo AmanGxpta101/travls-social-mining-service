@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { BadRequestException, Injectable } from "@nestjs/common";
+import { BadRequestException, ConflictException, Injectable } from "@nestjs/common";
 import { PrismaService } from "../../prisma/prisma.service";
 import { env } from "../../env";
 import { decryptToken, encryptToken } from "../../crypto";
@@ -56,6 +56,18 @@ export class ConnectService {
     const redirectUri = pending.platform === "web" ? env.x.redirectUriWeb : env.x.redirectUriMobile;
     const tokens = await exchangeCodeForTokens({ code, verifier: pending.verifier, redirectUri });
     const xUser = await fetchXUser(tokens.access_token);
+
+    // Decision on record: one Travls user per X account. Checked up front for
+    // a readable error; the (platform, external_user_id) unique index is what
+    // actually holds under a race. Stays bound after disconnect too, or
+    // disconnect/reconnect would be a way round it.
+    const linked = await this.prisma.userSocialAccount.findUnique({
+      where: { platform_externalUserId: { platform: "x", externalUserId: xUser.id } },
+    });
+    if (linked && linked.userId !== userId) {
+      await this.prisma.pendingOAuthState.delete({ where: { state } });
+      throw new ConflictException(`@${xUser.username} is already linked to another Travls account`);
+    }
 
     await this.prisma.userSocialAccount.upsert({
       where: { userId_platform: { userId, platform: "x" } },
