@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
-    "dev": "tsx watch src/main.ts",
+    "dev": "tsc-watch -p tsconfig.json --onSuccess \"node --env-file-if-exists=.env dist/main.js\"",
     "build": "tsc -p tsconfig.json",
     "start": "node dist/main.js",
     "typecheck": "tsc -p tsconfig.json --noEmit",
@@ -24,6 +24,7 @@
   "devDependencies": {
     "@types/express": "^4.17.21",
     "prisma": "^5.20.0",
+    "tsc-watch": "^7.2.1",
     "tsx": "^4.19.0",
     "typescript": "^5.6.0"
   }
