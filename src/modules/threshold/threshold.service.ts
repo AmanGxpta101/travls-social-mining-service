@@ -55,18 +55,29 @@ export class ThresholdService implements OnModuleInit {
   }
 
   async evaluate(snapshot: MetricSnapshot, tier: ShareTier) {
-    const thresholds = await this.prisma.rewardThreshold.findMany({ where: { active: true, tier } });
-    const thresholdsMet: string[] = [];
-    let allMet = thresholds.length > 0;
+    return (await this.evaluator())(snapshot, tier);
+  }
 
-    for (const t of thresholds) {
-      const field = METRIC_FIELD[t.metric];
-      const value = field ? snapshot[field] : undefined;
-      const met = value !== undefined && value >= t.minValue;
-      if (met) thresholdsMet.push(t.metric);
-      else allMet = false;
-    }
+  /**
+   * Loads the active thresholds once and returns a synchronous checker, so
+   * scoring a whole list of shares costs one query instead of one per share.
+   */
+  async evaluator() {
+    const thresholds = await this.prisma.rewardThreshold.findMany({ where: { active: true } });
+    return (snapshot: MetricSnapshot, tier: ShareTier) => {
+      const forTier = thresholds.filter((t) => t.tier === tier);
+      const thresholdsMet: string[] = [];
+      let allMet = forTier.length > 0;
 
-    return { eligible: allMet, thresholdsMet };
+      for (const t of forTier) {
+        const field = METRIC_FIELD[t.metric];
+        const value = field ? snapshot[field] : undefined;
+        const met = value !== undefined && value >= t.minValue;
+        if (met) thresholdsMet.push(t.metric);
+        else allMet = false;
+      }
+
+      return { eligible: allMet, thresholdsMet };
+    };
   }
 }

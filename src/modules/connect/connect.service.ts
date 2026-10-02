@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
-import { BadRequestException, ConflictException, Injectable } from "@nestjs/common";
+import { BadRequestException, Injectable } from "@nestjs/common";
 import { PrismaService } from "../../prisma/prisma.service";
+import { KolService } from "../kol/kol.service";
 import { env } from "../../env";
 import { decryptToken, encryptToken } from "../../crypto";
 import {
@@ -22,16 +23,18 @@ function expiresAtFrom(tokens: TokenResponse): Date {
 
 @Injectable()
 export class ConnectService {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly kolService: KolService,
+  ) {}
 
-  async initConnect(userId: string, platform: "web" | "mobile") {
+  async initConnect(platform: "web" | "mobile") {
     const { verifier, challenge } = generatePkce();
     const state = randomUUID();
 
     await this.prisma.pendingOAuthState.create({
       data: {
         state,
-        userId,
         platform,
         verifier,
         expiresAt: new Date(Date.now() + STATE_TTL_MS),
@@ -43,13 +46,25 @@ export class ConnectService {
     return { authorizeUrl, state };
   }
 
-  async handleConnectCallback(userId: string, code: string, state: string) {
+  /**
+   * Signing in with X: the X account decides the user. One seen before gets
+   * its existing userId back; a new one gets a freshly minted userId. So each
+   * X account is exactly one user, and a client can never pile several X
+   * accounts onto one userId. The client stores the returned userId and sends
+   * it as its session token from then on.
+   *
+   * Placeholder until the core team's session auth is wired in (see
+   * SessionGuard) — then the userId comes from Travls and this links to it.
+   */
+  async handleConnectCallback(code: string, state: string) {
+    // The state is random, single-use and short-lived, and the PKCE verifier
+    // never leaves the server — that's what ties this callback to its init.
     const pending = await this.prisma.pendingOAuthState.findUnique({ where: { state } });
-    if (!pending || pending.userId !== userId) {
+    if (!pending) {
       throw new BadRequestException("unknown or expired OAuth state");
     }
+    await this.prisma.pendingOAuthState.delete({ where: { state } });
     if (pending.expiresAt < new Date()) {
-      await this.prisma.pendingOAuthState.delete({ where: { state } });
       throw new BadRequestException("OAuth state expired, restart connect");
     }
 
@@ -57,43 +72,23 @@ export class ConnectService {
     const tokens = await exchangeCodeForTokens({ code, verifier: pending.verifier, redirectUri });
     const xUser = await fetchXUser(tokens.access_token);
 
-    // Decision on record: one Travls user per X account. Checked up front for
-    // a readable error; the (platform, external_user_id) unique index is what
-    // actually holds under a race. Stays bound after disconnect too, or
-    // disconnect/reconnect would be a way round it.
-    const linked = await this.prisma.userSocialAccount.findUnique({
+    const credentials = {
+      handle: xUser.username,
+      accessTokenEnc: encryptToken(tokens.access_token),
+      accessTokenExpiresAt: expiresAtFrom(tokens),
+      refreshTokenEnc: tokens.refresh_token ? encryptToken(tokens.refresh_token) : null,
+      tokenStatus: "active" as const,
+    };
+    const account = await this.prisma.userSocialAccount.upsert({
       where: { platform_externalUserId: { platform: "x", externalUserId: xUser.id } },
-    });
-    if (linked && linked.userId !== userId) {
-      await this.prisma.pendingOAuthState.delete({ where: { state } });
-      throw new ConflictException(`@${xUser.username} is already linked to another Travls account`);
-    }
-
-    await this.prisma.userSocialAccount.upsert({
-      where: { userId_platform: { userId, platform: "x" } },
-      create: {
-        userId,
-        platform: "x",
-        externalUserId: xUser.id,
-        handle: xUser.username,
-        accessTokenEnc: encryptToken(tokens.access_token),
-        accessTokenExpiresAt: expiresAtFrom(tokens),
-        refreshTokenEnc: tokens.refresh_token ? encryptToken(tokens.refresh_token) : null,
-        tokenStatus: "active",
-      },
-      update: {
-        externalUserId: xUser.id,
-        handle: xUser.username,
-        accessTokenEnc: encryptToken(tokens.access_token),
-        accessTokenExpiresAt: expiresAtFrom(tokens),
-        refreshTokenEnc: tokens.refresh_token ? encryptToken(tokens.refresh_token) : null,
-        tokenStatus: "active",
-      },
+      create: { userId: `usr_${randomUUID()}`, platform: "x", externalUserId: xUser.id, ...credentials },
+      update: credentials,
     });
 
-    await this.prisma.pendingOAuthState.delete({ where: { state } });
+    // Ops may have added this handle as a KOL before the account connected.
+    await this.kolService.promoteInvite(account.userId, xUser.username);
 
-    return { handle: xUser.username, xUserId: xUser.id, tokenStatus: "active" as const };
+    return { userId: account.userId, handle: xUser.username, xUserId: xUser.id, tokenStatus: "active" as const };
   }
 
   async disconnect(userId: string) {

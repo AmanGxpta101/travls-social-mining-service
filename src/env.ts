@@ -23,4 +23,10 @@ export const env = {
     apiKey: process.env.LEDGER_API_KEY ?? "",
   },
   opsApiKey: process.env.OPS_API_KEY ?? "",
+  // Challenge images live in a public Supabase Storage bucket.
+  supabase: {
+    url: (process.env.SUPABASE_URL ?? "").replace(/\/$/, ""),
+    serviceRoleKey: process.env.SUPABASE_SERVICE_ROLE_KEY ?? "",
+    mediaBucket: process.env.SUPABASE_MEDIA_BUCKET ?? "challenge-media",
+  },
 };

@@ -21,6 +21,8 @@ export interface TweetForVerification {
   text: string;
   /** Expanded (pre-t.co) URLs — `text` only carries the t.co short links. */
   expandedUrls: string[];
+  /** True when the post has a photo, GIF or video attached. */
+  hasMedia: boolean;
   metrics: PublicMetrics;
 }
 
@@ -30,6 +32,7 @@ interface TweetLookupBody {
     text: string;
     public_metrics: PublicMetrics;
     entities?: { urls?: { expanded_url?: string }[] };
+    attachments?: { media_keys?: string[] };
   };
   errors?: unknown[];
 }
@@ -50,7 +53,7 @@ async function lookupTweet(
   }
   recordXApiCall(purpose);
   const url = new URL(`https://api.x.com/2/tweets/${tweetId}`);
-  url.searchParams.set("tweet.fields", "public_metrics,author_id,entities");
+  url.searchParams.set("tweet.fields", "public_metrics,author_id,entities,attachments");
 
   const res = await fetch(url, { headers: { Authorization: `Bearer ${env.x.bearerToken}` } });
 
@@ -84,6 +87,7 @@ export async function fetchTweetForVerification(tweetId: string): Promise<TweetF
     authorId: data.author_id,
     text: data.text,
     expandedUrls: (data.entities?.urls ?? []).flatMap((u) => (u.expanded_url ? [u.expanded_url] : [])),
+    hasMedia: (data.attachments?.media_keys?.length ?? 0) > 0,
     metrics: data.public_metrics,
   };
 }

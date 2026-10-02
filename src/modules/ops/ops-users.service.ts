@@ -4,6 +4,7 @@ import { PrismaService } from "../../prisma/prisma.service";
 import { TasksService } from "../tasks/tasks.service";
 import { PointsService } from "../points/points.service";
 import { completedChallenges, countsAsDone, pointsFor } from "../tasks/progress";
+import { hasEnded } from "../tasks/deadline";
 
 const METRIC_KEYS = ["likes", "retweets", "replies", "quoteCount", "bookmarkCount", "impressionCount"] as const;
 type Metrics = Record<(typeof METRIC_KEYS)[number], number>;
@@ -104,20 +105,27 @@ export class OpsUsersService {
       const attempts = shares.filter((s) => s.copyVariant === task.id);
       const done = completed.get(task.id);
       const block = blockByTask.get(task.id);
+      // Same rule as the user's own list: missed only if they were here before it ended.
+      const missed = hasEnded(task) && Boolean(account && account.connectedAt < task.deadline!);
       const status = done
         ? "completed"
         : block
           ? "blocked"
           : !task.active
-            ? "retired"
-            : attempts.some((s) => s.postStatus === "pending_confirmation")
-              ? "awaiting_post"
-              : "not_started";
+            ? "archived"
+            : hasEnded(task)
+              ? missed
+                ? "missed"
+                : "ended"
+              : attempts.some((s) => s.postStatus === "pending_confirmation")
+                ? "awaiting_post"
+                : "not_started";
       return {
         id: task.id,
         title: task.title,
         points: task.points,
         active: task.active,
+        deadline: task.deadline?.toISOString() ?? null,
         status,
         completedAt: done?.sharedAt.toISOString() ?? null,
         completedShareId: done?.id ?? null,

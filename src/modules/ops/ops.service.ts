@@ -3,6 +3,7 @@ import { PrismaService } from "../../prisma/prisma.service";
 import { ThresholdService } from "../threshold/threshold.service";
 import { EngagementService } from "../engagement/engagement.service";
 import { TasksService } from "../tasks/tasks.service";
+import { hasEnded } from "../tasks/deadline";
 import { PointsService } from "../points/points.service";
 
 @Injectable()
@@ -94,7 +95,7 @@ export class OpsService {
     return { ok: true };
   }
 
-  /** Every challenge, retired ones included, with how many users have completed each. */
+  /** Every challenge, archived ones included, with how many users have completed each. */
   async listTasks() {
     const [tasks, done] = await Promise.all([
       this.tasksService.listAll(),
@@ -108,6 +109,8 @@ export class OpsService {
     return tasks.map((t) => ({
       ...t,
       createdAt: t.createdAt.toISOString(),
+      deadline: t.deadline?.toISOString() ?? null,
+      ended: hasEnded(t),
       completions: completions.get(t.id) ?? 0,
     }));
   }
@@ -131,12 +134,17 @@ export class OpsService {
    * was never recorded (pending, or deleted before the backfill could see
    * them), flagged so ops can tell.
    */
-  private async shareHandle(share: { userId: string; authorHandle: string | null }) {
-    if (share.authorHandle) return { handle: share.authorHandle, handleIsCurrentAccount: false };
-    const account = await this.prisma.userSocialAccount.findUnique({
-      where: { userId_platform: { userId: share.userId, platform: "x" } },
-    });
-    return { handle: account?.handle ?? null, handleIsCurrentAccount: Boolean(account) };
+  private async shareHandles(shares: { userId: string; authorHandle: string | null }[]) {
+    const unrecorded = [...new Set(shares.filter((s) => !s.authorHandle).map((s) => s.userId))];
+    const accounts = unrecorded.length
+      ? await this.prisma.userSocialAccount.findMany({ where: { userId: { in: unrecorded }, platform: "x" } })
+      : [];
+    const accountHandle = new Map(accounts.map((a) => [a.userId, a.handle]));
+    return (share: { userId: string; authorHandle: string | null }) => {
+      if (share.authorHandle) return { handle: share.authorHandle, handleIsCurrentAccount: false };
+      const handle = accountHandle.get(share.userId);
+      return { handle: handle ?? null, handleIsCurrentAccount: accountHandle.has(share.userId) };
+    };
   }
 
   /**
@@ -145,7 +153,7 @@ export class OpsService {
    * "who do I pay" queue. This is "what's everyone sharing, how's it doing."
    */
   async listAllShares() {
-    const [shares, tasks, blocks, adjustments] = await Promise.all([
+    const [shares, tasks, blocks, adjustments, evaluate] = await Promise.all([
       this.prisma.socialShare.findMany({
         orderBy: { sharedAt: "desc" },
         include: {
@@ -156,20 +164,22 @@ export class OpsService {
       this.tasksService.listAll(),
       this.prisma.taskBlock.findMany(),
       this.prisma.pointsAdjustment.findMany({ where: { shareId: { not: null } }, orderBy: { issuedAt: "desc" } }),
+      this.thresholdService.evaluator(),
     ]);
+    const shareHandle = await this.shareHandles(shares);
     const taskById = new Map(tasks.map((t) => [t.id, t]));
     const blockByKey = new Map(blocks.map((b) => [`${b.userId}:${b.taskId}`, b]));
 
     const rows = [];
     for (const share of shares) {
       const snapshot = share.snapshots[0];
-      const evaluation = snapshot ? await this.thresholdService.evaluate(snapshot, share.tier) : null;
+      const evaluation = snapshot ? evaluate(snapshot, share.tier) : null;
       const credit = share.manualCredits[0];
 
       rows.push({
         shareId: share.id,
         userId: share.userId,
-        ...(await this.shareHandle(share)),
+        ...shareHandle(share),
         postUrl: share.externalPostId ? `https://x.com/i/status/${share.externalPostId}` : null,
         postStatus: share.postStatus,
         tier: share.tier,
@@ -221,19 +231,20 @@ export class OpsService {
       include: { snapshots: { orderBy: { fetchedAt: "desc" }, take: 1 }, manualCredits: true },
     });
 
+    const [evaluate, shareHandle] = await Promise.all([this.thresholdService.evaluator(), this.shareHandles(shares)]);
     const rows = [];
     for (const share of shares) {
       if (share.manualCredits.length > 0) continue; // already credited, don't show again
       const snapshot = share.snapshots[0];
       if (!snapshot) continue;
 
-      const { eligible, thresholdsMet } = await this.thresholdService.evaluate(snapshot, share.tier);
+      const { eligible, thresholdsMet } = evaluate(snapshot, share.tier);
       if (!eligible) continue;
 
       rows.push({
         userId: share.userId,
         shareId: share.id,
-        ...(await this.shareHandle(share)),
+        ...shareHandle(share),
         tier: share.tier,
         externalPostId: share.externalPostId,
         thresholdsMet,

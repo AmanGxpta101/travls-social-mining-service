@@ -1,4 +1,18 @@
-import { Body, Controller, Delete, Get, Param, Patch, Post, UseGuards } from "@nestjs/common";
+import {
+  BadRequestException,
+  Body,
+  Controller,
+  Delete,
+  Get,
+  Param,
+  Patch,
+  Post,
+  Put,
+  UploadedFile,
+  UseGuards,
+  UseInterceptors,
+} from "@nestjs/common";
+import { FileInterceptor } from "@nestjs/platform-express";
 import { OpsKeyGuard } from "../../auth/ops-key.guard";
 import { OpsService } from "./ops.service";
 import { IssueCreditDto } from "./dto/issue-credit.dto";
@@ -6,13 +20,22 @@ import { AddKolDto } from "./dto/add-kol.dto";
 import { KolService } from "../kol/kol.service";
 import { TasksService } from "../tasks/tasks.service";
 import { OpsUsersService } from "./ops-users.service";
+import { CHALLENGE_IMAGE_MAX_BYTES } from "../media/storage";
 import {
   BlockTaskDto,
   CreateTaskDto,
   DeductPointsDto,
   InvalidateShareDto,
   SetTaskActiveDto,
+  SetTaskDeadlineDto,
 } from "./dto/moderation.dto";
+
+/** The parts of multer's in-memory file these routes read. */
+interface UploadedImage {
+  buffer: Buffer;
+  mimetype: string;
+  size: number;
+}
 
 @Controller("v1/ops")
 @UseGuards(OpsKeyGuard)
@@ -98,6 +121,11 @@ export class OpsController {
     return this.kolService.remove(userId);
   }
 
+  @Delete("kols/pending/:handle")
+  removeKolInvite(@Param("handle") handle: string) {
+    return this.kolService.removeInvite(handle);
+  }
+
   // Per-user challenge blocks.
   @Post("task-blocks")
   blockTask(@Body() body: BlockTaskDto) {
@@ -115,9 +143,33 @@ export class OpsController {
     return this.opsService.listTasks();
   }
 
+  // JSON, or multipart with an optional `image` file posted with the challenge.
   @Post("tasks")
-  createTask(@Body() body: CreateTaskDto) {
-    return this.tasksService.create({ ...body, createdBy: body.by });
+  @UseInterceptors(FileInterceptor("image", { limits: { fileSize: CHALLENGE_IMAGE_MAX_BYTES } }))
+  createTask(@Body() body: CreateTaskDto, @UploadedFile() image?: UploadedImage) {
+    return this.tasksService.create({
+      ...body,
+      createdBy: body.by,
+      deadline: body.deadline || undefined,
+      image: image ? { buffer: image.buffer, mimeType: image.mimetype } : undefined,
+    });
+  }
+
+  @Put("tasks/:id/image")
+  @UseInterceptors(FileInterceptor("image", { limits: { fileSize: CHALLENGE_IMAGE_MAX_BYTES } }))
+  setTaskImage(@Param("id") id: string, @UploadedFile() image?: UploadedImage) {
+    if (!image) throw new BadRequestException("attach an image");
+    return this.tasksService.setImage(id, { buffer: image.buffer, mimeType: image.mimetype });
+  }
+
+  @Put("tasks/:id/deadline")
+  setTaskDeadline(@Param("id") id: string, @Body() body: SetTaskDeadlineDto) {
+    return this.tasksService.setDeadline(id, body.deadline ?? null);
+  }
+
+  @Delete("tasks/:id/image")
+  removeTaskImage(@Param("id") id: string) {
+    return this.tasksService.setImage(id, null);
   }
 
   @Patch("tasks/:id")

@@ -21,13 +21,14 @@ export class RewardsService {
       include: { snapshots: { orderBy: { fetchedAt: "desc" }, take: 1 } },
     });
 
+    const evaluate = await this.thresholdService.evaluator();
     const metThresholds = new Set<string>();
     let eligible = false;
 
     for (const share of shares) {
       const snapshot = share.snapshots[0];
       if (!snapshot) continue;
-      const result = await this.thresholdService.evaluate(snapshot, share.tier);
+      const result = evaluate(snapshot, share.tier);
       if (result.eligible) eligible = true;
       for (const m of result.thresholdsMet) metThresholds.add(m);
     }

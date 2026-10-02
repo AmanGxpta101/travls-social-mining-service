@@ -16,31 +16,57 @@ export class KolService {
     return Boolean(row);
   }
 
+  /** Connected KOLs first, then handles still waiting for their owner to connect X. */
   async list() {
-    const rows = await this.prisma.kolAllowlist.findMany({ orderBy: { addedAt: "desc" } });
+    const [rows, invites] = await Promise.all([
+      this.prisma.kolAllowlist.findMany({ orderBy: { addedAt: "desc" } }),
+      this.prisma.kolInvite.findMany({ orderBy: { addedAt: "desc" } }),
+    ]);
     const accounts = await this.prisma.userSocialAccount.findMany({
       where: { platform: "x", userId: { in: rows.map((r) => r.userId) } },
     });
     const handleByUser = new Map(accounts.map((a) => [a.userId, a.handle]));
-    return rows.map((r) => ({
-      userId: r.userId,
-      handle: handleByUser.get(r.userId) ?? null,
-      addedBy: r.addedBy,
-      addedAt: r.addedAt.toISOString(),
-    }));
+    return [
+      ...rows.map((r) => ({
+        userId: r.userId as string | null,
+        handle: handleByUser.get(r.userId) ?? null,
+        pending: false,
+        addedBy: r.addedBy,
+        addedAt: r.addedAt.toISOString(),
+      })),
+      ...invites.map((i) => ({
+        userId: null,
+        handle: i.handle,
+        pending: true,
+        addedBy: i.addedBy,
+        addedAt: i.addedAt.toISOString(),
+      })),
+    ];
   }
 
-  /** Accepts either a userId or an X handle (resolved via the user's connected account). */
+  /**
+   * Accepts a userId or an X handle. A handle that's already connected makes
+   * that user a KOL now; one that isn't is kept as a pending invite and
+   * promoted the moment that X account connects (promoteInvite).
+   */
   async add(params: { userId?: string; handle?: string; addedBy: string }) {
     let userId = params.userId?.trim();
     if (!userId) {
-      const handle = params.handle?.trim().replace(/^@/, "");
+      const handle = normalizeHandle(params.handle);
       if (!handle) throw new BadRequestException("userId or handle is required");
+      if (!/^[a-z0-9_]{1,15}$/.test(handle)) {
+        throw new BadRequestException(`@${handle} isn't a valid X handle`);
+      }
       const account = await this.prisma.userSocialAccount.findFirst({
         where: { platform: "x", handle: { equals: handle, mode: "insensitive" } },
       });
       if (!account) {
-        throw new NotFoundException(`no connected X account with handle @${handle} — add by userId instead`);
+        await this.prisma.kolInvite.upsert({
+          where: { handle },
+          create: { handle, addedBy: params.addedBy },
+          update: {},
+        });
+        return { userId: null, handle, pending: true };
       }
       userId = account.userId;
     }
@@ -50,11 +76,38 @@ export class KolService {
       create: { userId, addedBy: params.addedBy },
       update: {},
     });
-    return { userId };
+    return { userId, pending: false };
+  }
+
+  /**
+   * Called when an X account connects: if ops pre-approved its handle, the
+   * user becomes a KOL now, credited to whoever added the handle.
+   */
+  async promoteInvite(userId: string, handle: string) {
+    const invite = await this.prisma.kolInvite.findUnique({ where: { handle: normalizeHandle(handle) } });
+    if (!invite) return;
+    await this.prisma.$transaction([
+      this.prisma.kolAllowlist.upsert({
+        where: { userId },
+        create: { userId, addedBy: invite.addedBy, addedAt: invite.addedAt },
+        update: {},
+      }),
+      this.prisma.kolInvite.delete({ where: { handle: invite.handle } }),
+    ]);
   }
 
   async remove(userId: string) {
     await this.prisma.kolAllowlist.deleteMany({ where: { userId } });
     return { ok: true };
   }
+
+  /** Withdraws a handle that hasn't connected yet. */
+  async removeInvite(handle: string) {
+    await this.prisma.kolInvite.deleteMany({ where: { handle: normalizeHandle(handle) } });
+    return { ok: true };
+  }
+}
+
+function normalizeHandle(handle: string | undefined): string {
+  return (handle ?? "").trim().replace(/^@/, "").toLowerCase();
 }

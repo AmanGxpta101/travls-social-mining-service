@@ -1,4 +1,5 @@
-import { IsBoolean, IsInt, IsNotEmpty, IsOptional, IsPositive, IsString, MaxLength } from "class-validator";
+import { Type } from "class-transformer";
+import { IsBoolean, IsInt, IsNotEmpty, IsOptional, IsPositive, IsString, Matches, MaxLength } from "class-validator";
 
 export class InvalidateShareDto {
   @IsString()
@@ -65,6 +66,8 @@ export class CreateTaskDto {
   @IsNotEmpty()
   template!: string;
 
+  // Multipart forms (a challenge with an image) send every field as text.
+  @Type(() => Number)
   @IsInt()
   @IsPositive()
   points!: number;
@@ -72,6 +75,18 @@ export class CreateTaskDto {
   @IsString()
   @IsNotEmpty()
   by!: string;
+
+  /** YYYY-MM-DD, end of that day IST. Omitted or empty: no deadline. */
+  @IsOptional()
+  @Matches(/^(\d{4}-\d{2}-\d{2})?$/)
+  deadline?: string;
+}
+
+export class SetTaskDeadlineDto {
+  /** YYYY-MM-DD, or null to remove the deadline. */
+  @IsOptional()
+  @Matches(/^\d{4}-\d{2}-\d{2}$/)
+  deadline!: string | null;
 }
 
 export class SetTaskActiveDto {

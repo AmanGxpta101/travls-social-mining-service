@@ -94,11 +94,12 @@ model EngagementSnapshot {
 }
 
 // Short-lived record bridging /connect/init -> /connect/callback (PKCE verifier +
-// which user/platform initiated it). Kept in the DB rather than in-memory so a
-// service restart mid-event doesn't strand an in-flight OAuth handshake.
+// platform). Kept in the DB rather than in-memory so a service restart
+// mid-event doesn't strand an in-flight OAuth handshake. No user: connecting is
+// how a user gets their ID (the X account decides it, see ConnectService).
 model PendingOAuthState {
   state     String   @id
-  userId    String   @map("user_id")
+  userId    String?  @map("user_id")
   platform  String
   verifier  String
   createdAt DateTime @default(now()) @map("created_at")
@@ -142,15 +143,33 @@ model KolAllowlist {
   @@map("kol_allowlist")
 }
 
+// A KOL ops added by X handle before that account connected. Connecting X
+// with this handle promotes it into kol_allowlist (see ConnectService). Stored
+// lowercase: X handles are case-insensitive.
+model KolInvite {
+  handle  String   @id
+  addedBy String   @map("added_by")
+  addedAt DateTime @default(now()) @map("added_at")
+
+  @@map("kol_invite")
+}
+
 // Challenges users can complete. Ops can add and retire them from the
 // dashboard; a share records its challenge id in copy_variant.
 model ShareTask {
   id          String   @id
   title       String
   description String
-  // Must contain `{link}`, replaced with the landing / per-share ref link.
+  // `{link}` (optional, at most once) becomes the landing / per-share ref link.
   template    String
   points      Int
+  // Public URL of the image posted with this challenge (Supabase Storage).
+  // Null means KOL posts carry the default promo image and community posts none.
+  imageUrl    String?  @map("image_url")
+  // Last moment a submission counts (end of the chosen day, IST). Null means
+  // the challenge runs until ops archives it. Past it, users who connected
+  // before it and hadn't completed it see it as missed.
+  deadline    DateTime?
   active      Boolean  @default(true)
   createdBy   String   @map("created_by")
   createdAt   DateTime @default(now()) @map("created_at")
