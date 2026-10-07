@@ -42,6 +42,11 @@ model UserSocialAccount {
   refreshTokenEnc  String?     @map("refresh_token_enc")
   tokenStatus      TokenStatus @default(active) @map("token_status")
   connectedAt      DateTime    @default(now()) @map("connected_at")
+  // The Travls user this account is linked to, once they've come in from the
+  // cards dashboard with Travls sync on. Our userId never changes; points go
+  // to this id. Null = standalone: points are held here until linked.
+  travlsUserId     String?     @unique @map("travls_user_id")
+  travlsLinkedAt   DateTime?   @map("travls_linked_at")
 
   @@unique([userId, platform])
   // One Travls user per X account — otherwise a single X account could farm
@@ -69,6 +74,9 @@ model SocialShare {
   invalidatedBy     String?  @map("invalidated_by")
   invalidatedAt     DateTime? @map("invalidated_at")
   postStatus     PostStatus  @default(pending_confirmation) @map("post_status")
+  // The challenge's photo bonus this submission earned (its post had a
+  // photo), fixed at verify time; part of its completion credit.
+  photoBonus     Int         @default(0) @map("photo_bonus")
   sharedAt       DateTime    @default(now()) @map("shared_at")
 
   snapshots     EngagementSnapshot[]
@@ -170,6 +178,8 @@ model ShareTask {
   // the challenge runs until ops archives it. Past it, users who connected
   // before it and hadn't completed it see it as missed.
   deadline    DateTime?
+  // Extra points when the user's post carries a photo of their own. 0 = none.
+  photoBonus  Int      @default(0) @map("photo_bonus")
   active      Boolean  @default(true)
   createdBy   String   @map("created_by")
   createdAt   DateTime @default(now()) @map("created_at")
@@ -204,7 +214,8 @@ model PointsAdjustment {
 }
 
 enum PointsEntryStatus {
-  // Recorded here, not yet accepted by Travls — the sync job retries it.
+  // Recorded here, not yet accepted by Travls — held while the user is
+  // unlinked or Travls sync is off, retried by the sync job otherwise.
   pending
   synced
   failed
@@ -220,6 +231,7 @@ model PointsLedgerEntry {
   userId         String            @map("user_id")
   // Signed: positive adds, negative removes.
   amount         Int
+  // Ours, not Travls' — the entry is pushed to the account's travlsUserId once linked.
   // Shown to the user and sent to Travls, e.g. `Completed "Announce you joined Travls"`.
   reason         String
   // challenge_completed | challenge_revoked | ops_deduction
@@ -236,21 +248,52 @@ model PointsLedgerEntry {
   createdBy      String            @map("created_by")
   createdAt      DateTime          @default(now()) @map("created_at")
   syncedAt       DateTime?         @map("synced_at")
-  // Synced to the in-memory stand-in, not to Travls. Re-queued as soon as the
-  // service starts with a real LEDGER_API_URL, so none of it is lost.
-  simulated      Boolean           @default(false)
 
   @@index([userId, createdAt])
   @@index([status])
   @@map("points_ledger_entry")
 }
 
-// Our copy of each user's Travls balance, for reconciliation against theirs.
-// Refreshed on every read of and write to Travls.
+// Our copy of each Travls user's balance, keyed by their Travls user id.
+// Refreshed on every session check and every points write.
 model TravlsPointsBalance {
   userId    String   @id @map("user_id")
   balance   Int
   fetchedAt DateTime @map("fetched_at")
 
   @@map("travls_points_balance")
+}
+
+// Every HTTP call to the Travls points API, as sent and as answered — for
+// checking the integration by eye. The access token is stored masked; the
+// signature is kept whole (it's useless without the secret). Pruned after 14 days.
+model TravlsApiCall {
+  id              String   @id @default(uuid())
+  at              DateTime @default(now())
+  method          String
+  path            String
+  // The Travls user the call was about, when known (unknown for a session check that failed).
+  userId          String?  @map("user_id")
+  requestHeaders  Json     @map("request_headers")
+  // The exact body string sent — what the signature covers.
+  requestBody     String?  @map("request_body")
+  status          Int?
+  responseBody    String?  @map("response_body")
+  // Network failure / timeout, when Travls never answered.
+  error           String?
+  durationMs      Int      @map("duration_ms")
+
+  @@index([at])
+  @@index([userId, at])
+  @@map("travls_api_call")
+}
+
+// Runtime switches ops flip from the dashboard. `travls_sync`: { on: boolean }.
+model AppSetting {
+  key       String   @id
+  value     Json
+  updatedBy String   @map("updated_by")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@map("app_setting")
 }

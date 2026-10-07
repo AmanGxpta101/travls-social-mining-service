@@ -1,5 +1,5 @@
 import { Type } from "class-transformer";
-import { IsBoolean, IsInt, IsNotEmpty, IsOptional, IsPositive, IsString, Matches, MaxLength } from "class-validator";
+import { IsBoolean, IsInt, IsNotEmpty, IsOptional, IsPositive, IsString, Matches, MaxLength, Min } from "class-validator";
 
 export class InvalidateShareDto {
   @IsString()
@@ -72,6 +72,13 @@ export class CreateTaskDto {
   @IsPositive()
   points!: number;
 
+  /** Extra points when the post has the user's own photo. Omitted: none. */
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(0)
+  photoBonus?: number;
+
   @IsString()
   @IsNotEmpty()
   by!: string;
@@ -92,4 +99,13 @@ export class SetTaskDeadlineDto {
 export class SetTaskActiveDto {
   @IsBoolean()
   active!: boolean;
+}
+
+export class SetTravlsSyncDto {
+  @IsBoolean()
+  on!: boolean;
+
+  @IsString()
+  @IsNotEmpty()
+  by!: string;
 }

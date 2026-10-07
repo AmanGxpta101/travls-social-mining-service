@@ -8,11 +8,11 @@ import {
   Injectable,
   NotFoundException,
 } from "@nestjs/common";
-import type { ShareTask } from "@prisma/client";
+import type { ShareTask, SocialShare } from "@prisma/client";
 import { PrismaService } from "../../prisma/prisma.service";
 import { ConnectService } from "../connect/connect.service";
 import { postTweet, uploadMedia } from "../connect/x-oauth";
-import { fetchTweetForVerification } from "../engagement/x-client";
+import { fetchRecentPosts, fetchTweetForVerification, type TweetForVerification } from "../engagement/x-client";
 import { KolService } from "../kol/kol.service";
 import { PointsService } from "../points/points.service";
 import { renderTaskCopy } from "../tasks/tasks.config";
@@ -45,6 +45,52 @@ function generateRefCode(): string {
  */
 function refLink(refCode: string): string {
   return `${LANDING_URL}/?ref=${refCode}`;
+}
+
+// A detect check is a paid read of up to 5 posts; at most one per share this often.
+const DETECT_MIN_INTERVAL_MS = 5_000;
+
+/** The post carries this share's ref code (challenges with {link}). */
+function hasRefCode(share: { refCode: string }, tweet: TweetForVerification): boolean {
+  const code = share.refCode.toLowerCase();
+  return [tweet.text, ...tweet.expandedUrls].some((s) => s.toLowerCase().includes(code));
+}
+
+/**
+ * Whether a post completes this community share — everything but the author,
+ * which the caller establishes. Throws with the reason, worded for the user.
+ */
+function checkPost(
+  share: { refCode: string; sharedAt: Date },
+  task: ShareTask | null,
+  postId: string,
+  tweet: TweetForVerification,
+) {
+  // Only that some media is attached — X doesn't let us compare it to ours.
+  if (task?.imageUrl && !tweet.hasMedia) {
+    throw new BadRequestException("that post is missing the challenge image — attach it and post again");
+  }
+  if (!task || task.template.includes("{link}")) {
+    if (!hasRefCode(share, tweet)) {
+      throw new BadRequestException("that post doesn't contain your Travls link — post the template as given");
+    }
+  } else {
+    // No link means no ref code to look for, so the post has to be this
+    // challenge's text, posted after the user started it — an older post
+    // with the same words can't be reused.
+    if (postedAt(postId) < share.sharedAt) {
+      throw new BadRequestException("that post is older than when you started this challenge — post it again");
+    }
+    if (!normalizePostText(tweet.text).includes(normalizePostText(task.template))) {
+      throw new BadRequestException("that post doesn't match the challenge text — post the template as given");
+    }
+  }
+}
+
+/** A post evidently meant for this challenge: it has the user's link (or, without one, the challenge text). */
+function mentionsShare(share: { refCode: string }, task: ShareTask | null, tweet: TweetForVerification): boolean {
+  if (!task || task.template.includes("{link}")) return hasRefCode(share, tweet);
+  return normalizePostText(tweet.text).includes(normalizePostText(task.template));
 }
 
 function composeIntentUrl(text: string): string {
@@ -88,6 +134,8 @@ export interface TaskView {
   points: number;
   /** The image to post with this challenge (public URL), or null. */
   imageUrl: string | null;
+  /** Extra points if the post has a photo of their own. 0 for challenges with an image of ours. */
+  photoBonus: number;
   /** Last moment a submission counts, or null if it runs until archived. */
   deadline: string | null;
   status: "not_started" | "awaiting_post" | "completed" | "blocked" | "missed";
@@ -97,6 +145,8 @@ export interface TaskView {
   composeUrl?: string;
   postUrl?: string;
   completedAt?: string;
+  /** completed only: the photo bonus the post earned (0 without a photo). */
+  photoBonusEarned?: number;
   rejection?: { reason: string; at: string | null };
 }
 
@@ -115,12 +165,13 @@ export class ShareService {
    * Adds the challenge's points to the user's Travls balance. Keyed on the
    * share, so a retry or a double-click can't credit twice; if Travls is
    * down the entry stays queued and the share still counts as completed.
+   * One entry covers the photo bonus too, so invalidating takes back both.
    */
-  private creditCompletion(userId: string, share: { id: string }, task: ShareTask) {
+  private creditCompletion(userId: string, share: { id: string; photoBonus: number }, task: ShareTask) {
     return this.pointsService.record({
       userId,
-      amount: task.points,
-      reason: `Completed "${task.title}"`,
+      amount: task.points + share.photoBonus,
+      reason: `Completed "${task.title}"${share.photoBonus ? ` (+${share.photoBonus} photo bonus)` : ""}`,
       kind: "challenge_completed",
       idempotencyKey: `share:${share.id}:credit`,
       shareId: share.id,
@@ -158,6 +209,7 @@ export class ShareService {
         description: task.description,
         points: task.points,
         imageUrl: task.imageUrl,
+        photoBonus: task.imageUrl ? 0 : task.photoBonus,
         deadline: task.deadline?.toISOString() ?? null,
       };
 
@@ -173,6 +225,7 @@ export class ShareService {
             copy: renderTaskCopy(task, done.refCode ? refLink(done.refCode) : LANDING_URL),
             postUrl: postUrlFor(done.externalPostId!),
             completedAt: done.sharedAt.toISOString(),
+            photoBonusEarned: done.photoBonus,
           },
         ];
       }
@@ -367,27 +420,13 @@ export class ShareService {
    * first engagement snapshot for free.
    */
   async confirmShare(userId: string, shareId: string, postInput: string) {
-    const share = await this.prisma.socialShare.findUnique({ where: { id: shareId } });
-    if (!share || share.userId !== userId) throw new NotFoundException("share not found");
-    if (share.tier !== "community" || !share.refCode) {
-      throw new BadRequestException("this share was posted directly and doesn't need confirming");
-    }
-    if (share.postStatus !== "pending_confirmation") {
-      throw new ConflictException("share already confirmed");
-    }
-    // Checked before the paid X read.
-    const task = await this.tasksService.find(share.copyVariant);
-    if (task && hasEnded(task)) {
-      throw new BadRequestException("this challenge has ended — submissions closed at its deadline");
-    }
+    const { share, task, account } = await this.pendingCommunityShare(userId, shareId);
 
     const postId = parsePostId(postInput);
     if (!postId) throw new BadRequestException("couldn't read a post id from that — paste the post's link");
 
     const claimed = await this.prisma.socialShare.findUnique({ where: { externalPostId: postId } });
     if (claimed) throw new ConflictException("that post has already been submitted");
-
-    const account = await this.requireConnectedAccount(userId);
 
     const tweet = await fetchTweetForVerification(postId);
     if (!tweet) {
@@ -396,28 +435,70 @@ export class ShareService {
     if (tweet.authorId !== account.externalUserId) {
       throw new BadRequestException(`that post isn't from your connected account @${account.handle}`);
     }
-    // Only that some media is attached — X doesn't let us compare it to ours.
-    if (task?.imageUrl && !tweet.hasMedia) {
-      throw new BadRequestException("that post is missing the challenge image — attach it and post again");
-    }
-    if (!task || task.template.includes("{link}")) {
-      const code = share.refCode.toLowerCase();
-      const hasCode = [tweet.text, ...tweet.expandedUrls].some((s) => s.toLowerCase().includes(code));
-      if (!hasCode) {
-        throw new BadRequestException("that post doesn't contain your Travls link — post the template as given");
-      }
-    } else {
-      // No link means no ref code to look for, so the post has to be this
-      // challenge's text, posted after the user started it — an older post
-      // with the same words can't be reused.
-      if (postedAt(postId) < share.sharedAt) {
-        throw new BadRequestException("that post is older than when you started this challenge — post it again");
-      }
-      if (!normalizePostText(tweet.text).includes(normalizePostText(task.template))) {
-        throw new BadRequestException("that post doesn't match the challenge text — post the template as given");
-      }
-    }
+    checkPost(share, task, postId, tweet);
+    return this.completeCommunityShare(share, task, account, postId, tweet);
+  }
 
+  /**
+   * Community tier, without the paste: looks through the user's latest posts
+   * (made since they started the challenge) for one that passes the same
+   * checks as confirmShare, and completes the challenge with it. The app
+   * calls this when the user comes back from X. `found: false` with a
+   * `hint` when a post has their link but fails a check (e.g. no image).
+   */
+  async detectShare(userId: string, shareId: string) {
+    const { share, task, account } = await this.pendingCommunityShare(userId, shareId);
+
+    // Each check is a paid read; the app polls a few times after a return from X.
+    const last = this.lastDetect.get(share.id) ?? 0;
+    if (Date.now() - last < DETECT_MIN_INTERVAL_MS) return { found: false as const, hint: null };
+    this.lastDetect.set(share.id, Date.now());
+
+    const posts = await fetchRecentPosts(account.externalUserId, share.sharedAt);
+    let hint: string | null = null;
+    for (const post of posts) {
+      if (await this.prisma.socialShare.findUnique({ where: { externalPostId: post.id } })) continue;
+      try {
+        checkPost(share, task, post.id, post);
+      } catch (err) {
+        // Only worth telling them about a post that was clearly meant for this challenge.
+        if (!hint && mentionsShare(share, task, post)) hint = (err as Error).message;
+        continue;
+      }
+      this.lastDetect.delete(share.id);
+      return { found: true as const, ...(await this.completeCommunityShare(share, task, account, post.id, post)) };
+    }
+    return { found: false as const, hint };
+  }
+
+  private readonly lastDetect = new Map<string, number>();
+
+  /** The user's own unconfirmed community share, its challenge (still open) and their X account. */
+  private async pendingCommunityShare(userId: string, shareId: string) {
+    const share = await this.prisma.socialShare.findUnique({ where: { id: shareId } });
+    if (!share || share.userId !== userId) throw new NotFoundException("share not found");
+    if (share.tier !== "community" || !share.refCode) {
+      throw new BadRequestException("this share was posted directly and doesn't need confirming");
+    }
+    if (share.postStatus !== "pending_confirmation") {
+      throw new ConflictException("share already confirmed");
+    }
+    // Checked before any paid X read.
+    const task = await this.tasksService.find(share.copyVariant);
+    if (task && hasEnded(task)) {
+      throw new BadRequestException("this challenge has ended — submissions closed at its deadline");
+    }
+    const account = await this.requireConnectedAccount(userId);
+    return { share: share as SocialShare & { refCode: string }, task, account };
+  }
+
+  private async completeCommunityShare(
+    share: SocialShare & { refCode: string },
+    task: ShareTask | null,
+    account: { handle: string },
+    postId: string,
+    tweet: TweetForVerification,
+  ) {
     const [updated] = await this.prisma.$transaction([
       this.prisma.socialShare.update({
         where: { id: share.id },
@@ -426,6 +507,10 @@ export class ShareService {
           postStatus: "confirmed",
           authorXUserId: tweet.authorId,
           authorHandle: account.handle,
+          // X only says media is attached, not what it is. A challenge with its
+          // own image requires media anyway, so the bonus is for challenges
+          // without one, where any photo is the user's own.
+          photoBonus: task && !task.imageUrl && tweet.hasMedia ? task.photoBonus : 0,
         },
       }),
       this.prisma.engagementSnapshot.create({
@@ -441,7 +526,7 @@ export class ShareService {
       }),
     ]);
 
-    if (task) await this.creditCompletion(userId, updated, task);
+    if (task) await this.creditCompletion(updated.userId, updated, task);
     return {
       shareId: updated.id,
       taskId: share.copyVariant,
@@ -449,6 +534,7 @@ export class ShareService {
       copy: task ? renderTaskCopy(task, refLink(share.refCode)) : null,
       status: updated.postStatus,
       postUrl: postUrlFor(postId),
+      photoBonus: updated.photoBonus,
     };
   }
 

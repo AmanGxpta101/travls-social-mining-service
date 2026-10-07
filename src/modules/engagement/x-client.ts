@@ -26,6 +26,18 @@ export interface TweetForVerification {
   metrics: PublicMetrics;
 }
 
+type TweetData = NonNullable<TweetLookupBody["data"]>;
+
+function toVerification(data: TweetData): TweetForVerification {
+  return {
+    authorId: data.author_id,
+    text: data.text,
+    expandedUrls: (data.entities?.urls ?? []).flatMap((u) => (u.expanded_url ? [u.expanded_url] : [])),
+    hasMedia: (data.attachments?.media_keys?.length ?? 0) > 0,
+    metrics: data.public_metrics,
+  };
+}
+
 interface TweetLookupBody {
   data?: {
     author_id: string;
@@ -82,12 +94,34 @@ export async function fetchTweetMetrics(tweetId: string): Promise<TweetLookupRes
 /** Community-tier paste-back verification; returns null if the post doesn't exist or isn't visible. */
 export async function fetchTweetForVerification(tweetId: string): Promise<TweetForVerification | null> {
   const data = await lookupTweet(tweetId, "share_verify");
-  if (!data) return null;
-  return {
-    authorId: data.author_id,
-    text: data.text,
-    expandedUrls: (data.entities?.urls ?? []).flatMap((u) => (u.expanded_url ? [u.expanded_url] : [])),
-    hasMedia: (data.attachments?.media_keys?.length ?? 0) > 0,
-    metrics: data.public_metrics,
-  };
+  return data ? toVerification(data) : null;
+}
+
+/**
+ * A user's own posts (no replies or reposts) made since `since`, newest
+ * first, at most 5 — X's minimum page size. For spotting a community post
+ * without the user pasting its link. App-only Bearer Token, like lookup.
+ */
+export async function fetchRecentPosts(
+  xUserId: string,
+  since: Date,
+): Promise<(TweetForVerification & { id: string })[]> {
+  if (!env.x.bearerToken) {
+    throw new HttpException("X_BEARER_TOKEN is not configured", HttpStatus.INTERNAL_SERVER_ERROR);
+  }
+  const url = new URL(`https://api.x.com/2/users/${encodeURIComponent(xUserId)}/tweets`);
+  url.searchParams.set("max_results", "5");
+  url.searchParams.set("exclude", "replies,retweets");
+  url.searchParams.set("start_time", since.toISOString());
+  url.searchParams.set("tweet.fields", "public_metrics,author_id,entities,attachments");
+
+  const res = await fetch(url, { headers: { Authorization: `Bearer ${env.x.bearerToken}` } });
+  if (!res.ok) {
+    recordXApiCall("share_detect", 0);
+    await throwOnXApiError(res, "share_detect");
+  }
+  const body = (await res.json()) as { data?: (TweetData & { id: string })[] };
+  const posts = body.data ?? [];
+  recordXApiCall("share_detect", posts.length);
+  return posts.map((p) => ({ id: p.id, ...toVerification(p) }));
 }

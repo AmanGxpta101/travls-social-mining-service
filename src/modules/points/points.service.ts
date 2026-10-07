@@ -1,8 +1,9 @@
-import { Inject, Injectable, Logger, OnModuleInit } from "@nestjs/common";
+import { Inject, Injectable, Logger, ServiceUnavailableException } from "@nestjs/common";
 import { Cron, CronExpression } from "@nestjs/schedule";
 import type { PointsLedgerEntry } from "@prisma/client";
 import { PrismaService } from "../../prisma/prisma.service";
-import { SimulatedTravlsPointsClient, type TravlsPointsClient } from "./travls-points.client";
+import type { TravlsPointsClient } from "./travls-points.client";
+import { TravlsSyncSwitch } from "./travls-sync-switch";
 
 export const TRAVLS_POINTS_CLIENT = Symbol("TRAVLS_POINTS_CLIENT");
 
@@ -21,17 +22,20 @@ export interface PointsChange {
 }
 
 const MAX_ATTEMPTS = 10;
+// A balance copy younger than this counts as live.
+const LIVE_WINDOW_MS = 5 * 60_000;
 
 /**
- * Scenario 1: Travls' points are the currency and their backend owns the
- * balance. Every add/remove is written to points_ledger_entry first, then
- * pushed to Travls; the entry records the balance before and after, and a
- * copy of the latest balance is kept for reconciliation. A failed push stays
- * in the log and the job below retries it — the user's action never fails
- * because Travls was down.
+ * Every add/remove of a user's points is written to points_ledger_entry under
+ * our userId. Travls' points are the currency (scenario 1), so once the user's
+ * X account is linked to a Travls user and Travls sync is on, entries are
+ * pushed to that Travls user's balance, oldest first; each records the balance
+ * before and after. Until then they're held here — nothing is lost while
+ * standalone, and linking later pushes the lot. A failed push stays in the log
+ * and the job below retries it; the user's action never fails because of it.
  */
 @Injectable()
-export class PointsService implements OnModuleInit {
+export class PointsService {
   private readonly logger = new Logger(PointsService.name);
   // Writes for one user go to Travls one at a time, oldest first, so each
   // entry's before/after is exact. The service runs as a single instance.
@@ -39,24 +43,11 @@ export class PointsService implements OnModuleInit {
 
   constructor(
     private readonly prisma: PrismaService,
-    @Inject(TRAVLS_POINTS_CLIENT) private readonly client: TravlsPointsClient,
+    @Inject(TRAVLS_POINTS_CLIENT) private readonly client: TravlsPointsClient | null,
+    private readonly syncSwitch: TravlsSyncSwitch,
   ) {}
 
-  get mode() {
-    return this.client.mode;
-  }
-
-  /** Going live: whatever only reached the simulator gets sent to Travls for real. */
-  async onModuleInit() {
-    if (this.client.mode !== "live") return;
-    const { count } = await this.prisma.pointsLedgerEntry.updateMany({
-      where: { simulated: true },
-      data: { simulated: false, status: "pending", attempts: 0, balanceBefore: null, balanceAfter: null, syncedAt: null },
-    });
-    if (count) this.logger.log(`re-queued ${count} points changes that were only simulated`);
-  }
-
-  /** Logs the change and tries to push it to Travls straight away. */
+  /** Logs the change and, if the user is linked and sync is on, pushes it to Travls straight away. */
   async record(change: PointsChange): Promise<PointsLedgerEntry> {
     const entry = await this.prisma.pointsLedgerEntry.upsert({
       where: { idempotencyKey: change.idempotencyKey },
@@ -79,25 +70,54 @@ export class PointsService implements OnModuleInit {
   }
 
   /**
-   * The user's Travls balance, live when Travls answers, else our last copy.
-   * Reading isn't a change, so nothing is logged — only the copy is refreshed.
+   * Checks a Travls access token with Travls and returns whose it is. Only
+   * while sync is on. Travls answers with the user's balance too, so this is
+   * also where our copy of it gets refreshed — their API has no other read.
    */
-  async getBalance(userId: string) {
-    try {
-      const balance = await this.remoteBalance(userId);
-      const copy = await this.saveCopy(userId, balance);
-      return { balance, asOf: copy.fetchedAt.toISOString(), live: true };
-    } catch (err) {
-      this.logger.warn(`Travls balance read failed for ${userId}: ${(err as Error).message}`);
-      const copy = await this.prisma.travlsPointsBalance.findUnique({ where: { userId } });
-      return { balance: copy?.balance ?? null, asOf: copy?.fetchedAt.toISOString() ?? null, live: false };
+  async verifyTravlsToken(accessToken: string) {
+    if (!this.client || !(await this.syncSwitch.isOn())) {
+      throw new ServiceUnavailableException("the Travls connection is paused");
     }
+    const session = await this.client.verifySession(accessToken);
+    await this.saveCopy(session.userId, session.balance);
+    return session;
   }
 
-  /** What the user sees: balance, points still on their way to Travls, and recent changes. */
+  /** Pushes whatever is held for this user now — e.g. right after they link. */
+  async syncNow(userId: string) {
+    await this.withUserLock(userId, () => this.syncUser(userId));
+  }
+
+  /**
+   * A Travls user's balance as last seen: on their latest token check or
+   * points write. `live` means Travls reported it within the last few minutes.
+   */
+  private async travlsBalance(travlsUserId: string | null) {
+    const copy = travlsUserId ? await this.prisma.travlsPointsBalance.findUnique({ where: { userId: travlsUserId } }) : null;
+    return {
+      balance: copy?.balance ?? null,
+      asOf: copy?.fetchedAt.toISOString() ?? null,
+      live: !!copy && Date.now() - copy.fetchedAt.getTime() < LIVE_WINDOW_MS,
+    };
+  }
+
+  private async travlsUserIdOf(userId: string) {
+    const account = await this.prisma.userSocialAccount.findUnique({
+      where: { userId_platform: { userId, platform: "x" } },
+      select: { travlsUserId: true },
+    });
+    return account?.travlsUserId ?? null;
+  }
+
+  /**
+   * What the user sees: whether they're linked to Travls, their Travls balance
+   * if so, points recorded but not yet in Travls (held or retrying), and recent changes.
+   */
   async summaryFor(userId: string, historyLimit = 10) {
-    const [balance, unsynced, history] = await Promise.all([
-      this.getBalance(userId),
+    const travlsUserId = await this.travlsUserIdOf(userId);
+    const [balance, syncOn, unsynced, history] = await Promise.all([
+      this.travlsBalance(travlsUserId),
+      this.syncSwitch.isOn(),
       this.prisma.pointsLedgerEntry.aggregate({
         where: { userId, status: { not: "synced" } },
         _sum: { amount: true },
@@ -109,8 +129,9 @@ export class PointsService implements OnModuleInit {
       }),
     ]);
     return {
+      linked: travlsUserId !== null,
+      syncOn,
       ...balance,
-      mode: this.client.mode,
       pending: unsynced._sum.amount ?? 0,
       history: history.map((e) => ({
         id: e.id,
@@ -124,30 +145,25 @@ export class PointsService implements OnModuleInit {
   }
 
   /**
-   * For ops: the full change log plus a reconciliation of our copy against
-   * Travls' live balance. `drift` is live − copy; non-zero just means Travls
-   * changed the balance for something outside social mining since we last
-   * looked, which is expected — the entries themselves are the audit trail.
+   * For ops: the full change log next to our copy of the linked Travls
+   * balance. Travls only reveals a balance to the user's own token or in a
+   * write's response, so ops can't pull a live figure on demand. A balance
+   * that moved between one entry's `balanceAfter` and the next one's
+   * `balanceBefore` was changed by Travls for something outside social
+   * mining, which is expected.
    */
   async reconcile(userId: string) {
-    const [copy, entries] = await Promise.all([
-      this.prisma.travlsPointsBalance.findUnique({ where: { userId } }),
+    const travlsUserId = await this.travlsUserIdOf(userId);
+    const [copy, entries, syncOn] = await Promise.all([
+      travlsUserId ? this.prisma.travlsPointsBalance.findUnique({ where: { userId: travlsUserId } }) : null,
       this.prisma.pointsLedgerEntry.findMany({ where: { userId }, orderBy: { createdAt: "desc" } }),
+      this.syncSwitch.isOn(),
     ]);
-    let live: number | null = null;
-    let liveError: string | null = null;
-    try {
-      live = await this.remoteBalance(userId);
-    } catch (err) {
-      liveError = (err as Error).message;
-    }
     const synced = entries.filter((e) => e.status === "synced");
     return {
-      mode: this.client.mode,
+      travlsUserId,
+      syncOn,
       copy: copy ? { balance: copy.balance, fetchedAt: copy.fetchedAt.toISOString() } : null,
-      live,
-      liveError,
-      drift: live !== null && copy ? live - copy.balance : null,
       socialMiningNet: synced.reduce((sum, e) => sum + e.amount, 0),
       unsynced: entries.filter((e) => e.status !== "synced").length,
       entries: entries.map((e) => ({
@@ -168,38 +184,71 @@ export class PointsService implements OnModuleInit {
     };
   }
 
+  /**
+   * Gives a user's failed entries (or everyone's) a fresh set of attempts and
+   * pushes them now — for after whatever made Travls reject them is fixed.
+   */
+  async requeueFailed(userId?: string) {
+    const { count } = await this.prisma.pointsLedgerEntry.updateMany({
+      where: { status: { not: "synced" }, ...(userId && { userId }) },
+      data: { attempts: 0 },
+    });
+    await this.retryUnsynced();
+    return { requeued: count };
+  }
+
+  /** Pushes held/failed entries of every linked user — the catch-up after sync is switched on. */
   @Cron(CronExpression.EVERY_MINUTE)
   async retryUnsynced(): Promise<void> {
+    if (!this.client || !(await this.syncSwitch.isOn())) return;
     const due = await this.prisma.pointsLedgerEntry.findMany({
       where: { status: { not: "synced" }, attempts: { lt: MAX_ATTEMPTS } },
       distinct: ["userId"],
       select: { userId: true },
     });
-    for (const { userId } of due) {
+    const linked = await this.prisma.userSocialAccount.findMany({
+      where: { userId: { in: due.map((d) => d.userId) }, platform: "x", travlsUserId: { not: null } },
+      select: { userId: true },
+    });
+    for (const { userId } of linked) {
       await this.withUserLock(userId, () => this.syncUser(userId)).catch(() => undefined);
     }
   }
 
-  /** Pushes this user's unsynced entries to Travls in order; stops at the first failure so order holds. */
+  /**
+   * Pushes this user's unsynced entries to their Travls user in order; stops
+   * at the first failure so order holds. Does nothing while sync is off or the
+   * user is unlinked — the entries stay held. An entry out of attempts blocks
+   * everything after it until ops re-queues it (requeueFailed) — skipping it
+   * could send a revoke for a credit that never landed, taking points the
+   * user never got.
+   */
   private async syncUser(userId: string) {
+    const client = this.client;
+    if (!client || !(await this.syncSwitch.isOn())) return;
+    const travlsUserId = await this.travlsUserIdOf(userId);
+    if (!travlsUserId) return;
     const entries = await this.prisma.pointsLedgerEntry.findMany({
-      where: { userId, status: { not: "synced" }, attempts: { lt: MAX_ATTEMPTS } },
+      where: { userId, status: { not: "synced" } },
       orderBy: { createdAt: "asc" },
     });
     for (const entry of entries) {
+      if (entry.attempts >= MAX_ATTEMPTS) {
+        this.logger.warn(`points sync for ${userId} is held at entry ${entry.id}: out of attempts (${entry.lastError ?? "no error"})`);
+        return;
+      }
       try {
-        const before = await this.remoteBalance(userId);
-        const reported = await this.client.applyChange(userId, {
+        const after = await client.applyChange(travlsUserId, {
           amount: entry.amount,
           reason: entry.reason,
           idempotencyKey: entry.idempotencyKey,
         });
-        const after = reported ?? before + entry.amount;
+        // Travls reports only the balance after the write; before follows from it.
+        const before = after - entry.amount;
         await this.prisma.pointsLedgerEntry.update({
           where: { id: entry.id },
           data: {
             status: "synced",
-            simulated: this.client.mode === "simulated",
             balanceBefore: before,
             balanceAfter: after,
             attempts: { increment: 1 },
@@ -207,9 +256,9 @@ export class PointsService implements OnModuleInit {
             syncedAt: new Date(),
           },
         });
-        await this.saveCopy(userId, after);
+        await this.saveCopy(travlsUserId, after);
         this.logger.log(
-          JSON.stringify({ event: "travls_points_synced", userId, amount: entry.amount, before, after, reason: entry.reason }),
+          JSON.stringify({ event: "travls_points_synced", userId, travlsUserId, amount: entry.amount, before, after, reason: entry.reason }),
         );
       } catch (err) {
         await this.prisma.pointsLedgerEntry.update({
@@ -220,14 +269,6 @@ export class PointsService implements OnModuleInit {
         return;
       }
     }
-  }
-
-  private async remoteBalance(userId: string) {
-    if (this.client instanceof SimulatedTravlsPointsClient) {
-      const copy = await this.prisma.travlsPointsBalance.findUnique({ where: { userId } });
-      this.client.seed(userId, copy?.balance ?? 0);
-    }
-    return this.client.getBalance(userId);
   }
 
   private saveCopy(userId: string, balance: number) {

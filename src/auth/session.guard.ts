@@ -1,23 +1,19 @@
 import { CanActivate, ExecutionContext, Injectable, UnauthorizedException } from "@nestjs/common";
 import type { Request } from "express";
+import { bearerToken, SessionService } from "./session.service";
 
-/**
- * Per plan §5: this service trusts the same session token the dashboard/mobile
- * app already issues — no separate login. Verification here is a placeholder;
- * wire it to the org's actual session-token verifier before this leaves Phase 0.
- */
+/** Resolves the session token (see SessionService) onto `req.userId`. */
 @Injectable()
 export class SessionGuard implements CanActivate {
+  constructor(private readonly sessions: SessionService) {}
+
   canActivate(context: ExecutionContext): boolean {
     const req = context.switchToHttp().getRequest<Request>();
-    const auth = req.headers.authorization;
-    const token = auth?.startsWith("Bearer ") ? auth.slice("Bearer ".length) : undefined;
+    const token = bearerToken(req);
     if (!token) {
       throw new UnauthorizedException("missing session token");
     }
-    // TODO: verify `token` against the core team's session store / JWT issuer
-    // and resolve the real userId. Placeholder decodes nothing and is not secure.
-    req.userId = token;
+    req.userId = this.sessions.resolve(token);
     return true;
   }
 }

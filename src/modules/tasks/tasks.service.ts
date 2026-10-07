@@ -52,6 +52,8 @@ export class TasksService {
     description: string;
     template: string;
     points: number;
+    /** Extra points for a post with the user's own photo; ignored if the challenge has an image. */
+    photoBonus?: number;
     createdBy: string;
     image?: ChallengeImage;
     /** YYYY-MM-DD; the challenge runs to the end of that day (IST). Omit for no deadline. */
@@ -73,6 +75,10 @@ export class TasksService {
     if (!Number.isInteger(input.points) || input.points <= 0) {
       throw new BadRequestException("points must be a positive whole number");
     }
+    const photoBonus = input.photoBonus ?? 0;
+    if (!Number.isInteger(photoBonus) || photoBonus < 0) {
+      throw new BadRequestException("the photo bonus must be a whole number, 0 or more");
+    }
     if (input.image) checkImage(input.image);
     const deadline = input.deadline ? parseDeadline(input.deadline) : null;
 
@@ -92,6 +98,7 @@ export class TasksService {
         description: input.description.trim(),
         template,
         points: input.points,
+        photoBonus,
         imageUrl,
         deadline,
         createdBy: input.createdBy,

@@ -15,6 +15,9 @@ const APPROX_USD_COST: Record<string, number | undefined> = {
   engagement_fetch: 0.005,
   // Community-tier paste-back verification: same tweet lookup, same rate.
   share_verify: 0.005,
+  // Looking for a just-made community post in the user's latest posts: the
+  // same rate, per post returned (up to 5 per check).
+  share_detect: 0.005,
   user_lookup: undefined,
   media_upload: undefined,
 };
@@ -22,14 +25,18 @@ const APPROX_USD_COST: Record<string, number | undefined> = {
 let callsThisProcess = 0;
 
 export function recordXApiCall(
-  purpose: "user_lookup" | "engagement_fetch" | "share_verify" | "share_post" | "media_upload",
+  purpose: "user_lookup" | "engagement_fetch" | "share_verify" | "share_detect" | "share_post" | "media_upload",
+  /** Resources billed by this call (posts returned, for reads). */
+  resources = 1,
 ) {
   callsThisProcess += 1;
+  const rate = APPROX_USD_COST[purpose];
   console.log(
     JSON.stringify({
       event: "x_api_call",
       purpose,
-      approxUsd: APPROX_USD_COST[purpose] ?? null,
+      resources,
+      approxUsd: rate === undefined ? null : rate * resources,
       processTotal: callsThisProcess,
       at: new Date().toISOString(),
     }),

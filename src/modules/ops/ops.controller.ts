@@ -8,6 +8,7 @@ import {
   Patch,
   Post,
   Put,
+  Query,
   UploadedFile,
   UseGuards,
   UseInterceptors,
@@ -20,6 +21,9 @@ import { AddKolDto } from "./dto/add-kol.dto";
 import { KolService } from "../kol/kol.service";
 import { TasksService } from "../tasks/tasks.service";
 import { OpsUsersService } from "./ops-users.service";
+import { TravlsApiLog } from "../points/travls-api-log";
+import { PointsService } from "../points/points.service";
+import { TravlsSyncSwitch } from "../points/travls-sync-switch";
 import { CHALLENGE_IMAGE_MAX_BYTES } from "../media/storage";
 import {
   BlockTaskDto,
@@ -28,6 +32,7 @@ import {
   InvalidateShareDto,
   SetTaskActiveDto,
   SetTaskDeadlineDto,
+  SetTravlsSyncDto,
 } from "./dto/moderation.dto";
 
 /** The parts of multer's in-memory file these routes read. */
@@ -45,7 +50,36 @@ export class OpsController {
     private readonly kolService: KolService,
     private readonly tasksService: TasksService,
     private readonly opsUsersService: OpsUsersService,
+    private readonly travlsApiLog: TravlsApiLog,
+    private readonly pointsService: PointsService,
+    private readonly travlsSync: TravlsSyncSwitch,
   ) {}
+
+  // The Travls connection switch: off = standalone, points held; on = link users and push points.
+  @Get("settings/travls-sync")
+  travlsSyncState() {
+    return this.travlsSync.state();
+  }
+
+  @Put("settings/travls-sync")
+  async setTravlsSync(@Body() body: SetTravlsSyncDto) {
+    const state = await this.travlsSync.set(body.on, body.by);
+    // Turning it on: push everything held for linked users now rather than on the next tick.
+    if (state.on) void this.pointsService.retryUnsynced().catch(() => undefined);
+    return state;
+  }
+
+  // Fresh attempts for points changes Travls rejected, once the cause is fixed. `?userId=` for one user.
+  @Post("points/requeue")
+  requeuePoints(@Query("userId") userId?: string) {
+    return this.pointsService.requeueFailed(userId || undefined);
+  }
+
+  // Every call made to the Travls points API, as sent and as answered.
+  @Get("travls-calls")
+  travlsCalls(@Query("userId") userId?: string, @Query("limit") limit?: string) {
+    return this.travlsApiLog.list({ userId: userId || undefined, limit: limit ? Number(limit) || undefined : undefined });
+  }
 
   // Campaign participants and per-user profiles (history, points, moderation).
   @Get("users")

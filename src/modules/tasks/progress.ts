@@ -32,14 +32,17 @@ export function completedChallenges<S extends ShareLike>(shares: S[], challengeI
   return byTask;
 }
 
-/** Earned points for completed challenges plus ops adjustments (stored negative). */
+/**
+ * Earned points for completed challenges (each with any photo bonus its
+ * submission earned) plus ops adjustments (stored negative).
+ */
 export function pointsFor(
-  completed: Map<string, unknown>,
+  completed: Map<string, { photoBonus: number }>,
   taskPoints: Map<string, number>,
   adjustments: { amount: number }[],
 ) {
   let earned = 0;
-  for (const taskId of completed.keys()) earned += taskPoints.get(taskId) ?? 0;
+  for (const [taskId, share] of completed) earned += (taskPoints.get(taskId) ?? 0) + share.photoBonus;
   const adjusted = adjustments.reduce((sum, a) => sum + a.amount, 0);
   return { earned, deducted: -adjusted, total: earned + adjusted };
 }

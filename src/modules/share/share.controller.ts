@@ -24,4 +24,10 @@ export class ShareController {
   confirm(@UserId() userId: string, @Param("id") shareId: string, @Body() body: ConfirmShareDto) {
     return this.shareService.confirmShare(userId, shareId, body.post);
   }
+
+  // Back from X: look for the post among the user's latest, no link pasted.
+  @Post("shares/:id/detect")
+  detect(@UserId() userId: string, @Param("id") shareId: string) {
+    return this.shareService.detectShare(userId, shareId);
+  }
 }

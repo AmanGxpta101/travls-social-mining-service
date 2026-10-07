@@ -18,11 +18,15 @@ export const env = {
     bearerToken: process.env.X_BEARER_TOKEN ?? "",
   },
   tokenEncryptionKey: process.env.TOKEN_ENCRYPTION_KEY ?? "",
-  ledger: {
-    apiUrl: process.env.LEDGER_API_URL ?? "",
-    apiKey: process.env.LEDGER_API_KEY ?? "",
+  // Travls profile-service: their points balance and their user sessions.
+  travls: {
+    apiUrl: process.env.TRAVLS_API_URL ?? "",
+    // Shared with Travls; signs each points transaction (x-signature).
+    signatureSecret: process.env.TRAVLS_POINT_SIGNATURE_SECRET ?? "",
   },
   opsApiKey: process.env.OPS_API_KEY ?? "",
+  // Signs the session tokens issued on X sign-in.
+  sessionSecret: required("SESSION_SECRET"),
   // Challenge images live in a public Supabase Storage bucket.
   supabase: {
     url: (process.env.SUPABASE_URL ?? "").replace(/\/$/, ""),

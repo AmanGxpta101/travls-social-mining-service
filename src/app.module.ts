@@ -1,6 +1,8 @@
 import { Module } from "@nestjs/common";
 import { ScheduleModule } from "@nestjs/schedule";
 import { PrismaModule } from "./prisma/prisma.module";
+import { PointsModule } from "./modules/points/points.module";
+import { AuthModule } from "./auth/auth.module";
 import { ConnectModule } from "./modules/connect/connect.module";
 import { ShareModule } from "./modules/share/share.module";
 import { EngagementModule } from "./modules/engagement/engagement.module";
@@ -14,6 +16,8 @@ import { AppController } from "./app.controller";
   imports: [
     ScheduleModule.forRoot(),
     PrismaModule,
+    PointsModule,
+    AuthModule,
     ConnectModule,
     ShareModule,
     EngagementModule,

@@ -65,6 +65,7 @@ export class OpsUsersService {
         userId,
         handle: account?.handle ?? null,
         connected: account?.tokenStatus === "active",
+        travlsUserId: account?.travlsUserId ?? null,
         isKol: kolSet.has(userId),
         challengesCompleted: completed.size,
         submissions: mine.length,
@@ -161,6 +162,8 @@ export class OpsUsersService {
             connected: account.tokenStatus === "active",
             tokenStatus: account.tokenStatus,
             connectedAt: account.connectedAt.toISOString(),
+            travlsUserId: account.travlsUserId,
+            travlsLinkedAt: account.travlsLinkedAt?.toISOString() ?? null,
           }
         : null,
       isKol: Boolean(kol),
@@ -226,8 +229,8 @@ export class OpsUsersService {
         if (before) continue;
         await this.pointsService.record({
           userId,
-          amount: task.points,
-          reason: `Completed "${task.title}"`,
+          amount: task.points + share.photoBonus,
+          reason: `Completed "${task.title}"${share.photoBonus ? ` (+${share.photoBonus} photo bonus)` : ""}`,
           kind: "challenge_completed",
           idempotencyKey: `share:${share.id}:credit`,
           shareId: share.id,
