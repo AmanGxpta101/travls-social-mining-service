@@ -4,7 +4,7 @@
   "private": true,
   "scripts": {
     "dev": "tsc-watch -p tsconfig.json --onSuccess \"node --env-file-if-exists=.env dist/main.js\"",
-    "build": "tsc -p tsconfig.json",
+    "build": "prisma generate && tsc -p tsconfig.json",
     "start": "node dist/main.js",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "prisma:generate": "prisma generate",
